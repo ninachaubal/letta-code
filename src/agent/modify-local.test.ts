@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { getModel } from "@earendil-works/pi-ai/compat";
+import { getBuiltinModel as getModel } from "@earendil-works/pi-ai/providers/all";
 import { configureBackendMode, getBackend } from "@/backend/backend";
 import { createOrUpdateLocalProvider } from "@/backend/local";
 import { LOCAL_BACKEND_DIR_ENV } from "@/backend/local/paths";
@@ -45,6 +45,18 @@ describe("local model updates", () => {
       provider_type: "xai",
       parallel_tool_calls: true,
       max_output_tokens: 16384,
+    });
+  });
+
+  test("builds direct Moonshot K3 settings without client reasoning controls", () => {
+    expect(
+      __modifyTestUtils.buildModelSettings("moonshot/kimi-k3", {
+        max_output_tokens: 131072,
+      }),
+    ).toMatchObject({
+      provider_type: "moonshot",
+      parallel_tool_calls: true,
+      max_output_tokens: 131072,
     });
   });
 
@@ -197,6 +209,53 @@ describe("local model updates", () => {
           provider_type: "anthropic",
           effort: "xhigh",
         });
+      });
+    } finally {
+      await rm(storageDir, { recursive: true, force: true });
+    }
+  });
+
+  test("uses conversation model defaults instead of agent token settings", async () => {
+    const storageDir = await mkdtemp(
+      join(tmpdir(), "local-conversation-model-defaults-"),
+    );
+    try {
+      await createOrUpdateLocalProvider({
+        providerType: "anthropic",
+        providerName: "lc-anthropic",
+        apiKey: "dummy",
+        storageDir,
+      });
+
+      await withLocalBackendStorage(storageDir, async () => {
+        const backend = getBackend();
+        const agent = await backend.createAgent({
+          name: "Local",
+          model: "openai-codex/gpt-5.5",
+          model_settings: { provider_type: "chatgpt_oauth" },
+          max_tokens: 128000,
+          context_window_limit: 272000,
+        } as never);
+        const conversation = await backend.createConversation({
+          agent_id: agent.id,
+          model: "anthropic/claude-fable-5",
+          model_settings: {
+            provider_type: "anthropic",
+            effort: "medium",
+          },
+        } as never);
+        const fable = getModel("anthropic", "claude-fable-5");
+
+        expect(conversation.model_settings).toMatchObject({
+          provider_type: "anthropic",
+          effort: "medium",
+          context_window_limit: fable?.contextWindow,
+          max_tokens: fable?.maxTokens,
+        });
+        expect(
+          (conversation.model_settings as Record<string, unknown>)
+            .context_window_limit,
+        ).not.toBe(agent.llm_config?.context_window);
       });
     } finally {
       await rm(storageDir, { recursive: true, force: true });

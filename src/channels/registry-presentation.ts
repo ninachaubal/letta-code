@@ -243,7 +243,11 @@ export function buildDirectReplyOptions(
 ): { replyToMessageId?: string; threadId?: string | null } | undefined {
   if (!msg.messageId && !msg.threadId) return undefined;
   return {
-    replyToMessageId: msg.threadId ?? msg.messageId ?? undefined,
+    // Reply-to anchors to the user's actual message, not the thread id: for
+    // bot topics the thread id is the topic root, so anchoring there would
+    // reply to the topic creation message instead. threadId still routes
+    // the reply into the topic.
+    replyToMessageId: msg.messageId ?? undefined,
     threadId: msg.threadId ?? null,
   };
 }

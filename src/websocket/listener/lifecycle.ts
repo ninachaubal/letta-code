@@ -37,6 +37,7 @@ import { isDebugEnabled } from "@/utils/debug";
 import { setMessageQueueAdder } from "@/utils/message-queue-bridge";
 import { killAllTerminals } from "@/websocket/terminal-handler";
 import { rejectPendingApprovalResolvers } from "./approval";
+import { resolveListenerReconnectAuth } from "./auth";
 import {
   recoverActiveChannelTurn,
   uniqueChannelTurnSources,
@@ -102,6 +103,7 @@ import {
   safeEmitWsEvent,
   setActiveRuntime,
 } from "./runtime";
+import { notifyStreamObserversRuntimeStopped } from "./stream-observers";
 import {
   getListenerTransportKind,
   isListenerTransportOpen,
@@ -109,6 +111,7 @@ import {
   LocalListenerTransport,
 } from "./transport";
 import { handleIncomingMessage } from "./turn";
+import { escapeTaskNotificationSummary } from "./turn-events";
 import type {
   ConversationRuntime,
   IncomingMessage,
@@ -121,13 +124,6 @@ import {
   scheduleListenerWarmupsAfterSync,
 } from "./warmup";
 import { stopAllWorktreeWatchers } from "./worktree-watcher";
-
-function escapeTaskNotificationSummary(summary: string): string {
-  return summary
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
-}
 
 function trackListenerError(
   errorType: string,
@@ -401,6 +397,29 @@ function getParsedRuntimeScope(
         ? runtime.conversation_id
         : "default",
   };
+}
+
+function terminateControlAfterStreamClose(
+  runtime: ListenerRuntime,
+  streamSocket: WebSocket,
+): void {
+  if (runtime.streamSocket !== streamSocket) {
+    return;
+  }
+  runtime.streamSocket = null;
+  runtime.streamTransport = null;
+
+  const controlSocket = runtime.socket;
+  if (
+    controlSocket &&
+    (controlSocket.readyState === WebSocket.OPEN ||
+      controlSocket.readyState === WebSocket.CONNECTING)
+  ) {
+    // The stream channel has no independent replay or reconnect path. Closing
+    // control tears down the paired session so its normal reconnect/bootstrap
+    // flow restores one coherent connection instead of silently losing frames.
+    controlSocket.terminate();
+  }
 }
 
 async function waitForStreamSocketOpen(
@@ -871,7 +890,6 @@ export function enqueueChannelTurn(
 
   return enqueuedItem;
 }
-
 export function createRuntime(): ListenerRuntime {
   const bootWorkingDirectory = getCurrentWorkingDirectory();
   return {
@@ -895,6 +913,7 @@ export function createRuntime(): ListenerRuntime {
     workingDirectoryByConversation: loadPersistedCwdMap(),
     worktreeWatcherByConversation: new Map(),
     permissionModeByConversation: loadPersistedPermissionModeMap(),
+    skillSourcesByConversation: new Map(),
     reminderStateByConversation: new Map(),
     contextTrackerByConversation: new Map(),
     systemPromptRecompileByConversation: new Map(),
@@ -917,6 +936,7 @@ export function stopRuntime(
   runtime: ListenerRuntime,
   suppressCallbacks: boolean,
 ): void {
+  notifyStreamObserversRuntimeStopped(runtime);
   disposeListenerModAdapter(runtime);
   rejectPendingExternalToolCalls(runtime, "Listener runtime stopped");
   setMessageQueueAdder(null); // Clear bridge for ALL stop paths
@@ -937,11 +957,11 @@ export function stopRuntime(
   runtime.approvalRuntimeKeyByRequestId.clear();
   clearListenerWarmState(runtime);
   runtime.reminderStateByConversation.clear();
+  runtime.skillSourcesByConversation.clear();
   runtime.contextTrackerByConversation.clear();
   runtime.systemPromptRecompileByConversation.clear();
   runtime.queuedSystemPromptRecompileByConversation.clear();
   stopAllWorktreeWatchers(runtime);
-
   if (!runtime.socket) {
     if (
       runtime.streamSocket &&
@@ -1325,10 +1345,7 @@ export async function attachOpenListenerSocket(
         );
       }
 
-      if (runtime.streamSocket === streamSocket) {
-        runtime.streamSocket = null;
-        runtime.streamTransport = null;
-      }
+      terminateControlAfterStreamClose(runtime, streamSocket);
     });
   }
 
@@ -1442,9 +1459,7 @@ export async function startLocalChannelListener(
   }
 }
 
-/**
- * Connect to WebSocket with exponential backoff retry.
- */
+/** Connect to WebSocket with exponential backoff retry. */
 async function connectWithRetry(
   runtime: ListenerRuntime,
   opts: StartListenerOptions,
@@ -1496,12 +1511,13 @@ async function connectWithRetry(
     await loadTools();
   }
 
-  const settings = await settingsManager.getSettingsWithSecureTokens();
-  const apiKey = process.env.LETTA_API_KEY || settings.env?.LETTA_API_KEY;
-
-  if (!apiKey) {
-    throw new Error("Missing LETTA_API_KEY");
+  const auth = await resolveListenerReconnectAuth(opts);
+  if (auth.kind === "retry")
+    return connectWithRetry(runtime, opts, attempt + 1, startTime);
+  if (runtime !== getActiveRuntime() || runtime.intentionallyClosed) {
+    return;
   }
+  const apiKey = auth.apiKey;
 
   const url = new URL(opts.wsUrl);
   url.searchParams.set("deviceId", opts.deviceId);
@@ -1736,10 +1752,7 @@ async function connectWithRetry(
         );
       }
 
-      if (runtime.streamSocket === streamSocket) {
-        runtime.streamSocket = null;
-        runtime.streamTransport = null;
-      }
+      terminateControlAfterStreamClose(runtime, streamSocket);
     });
   }
 }

@@ -17,13 +17,14 @@ import { getListenerTelemetrySurface } from "@/telemetry";
 import type { StreamDelta } from "@/types/protocol_v2";
 import {
   createListenerModContext,
-  ensureListenerModAdapter,
+  createListenerModEvents,
+  ensureListenerModAdaptersForAgent,
 } from "./mod-adapter";
 import { emitCanonicalMessageDelta } from "./protocol-outbound";
 import type { ListenerTransport } from "./transport";
 import type { ConversationRuntime, ListenerRuntime } from "./types";
 
-function escapeTaskNotificationSummary(summary: string): string {
+export function escapeTaskNotificationSummary(summary: string): string {
   return summary
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
@@ -53,7 +54,10 @@ export async function emitListenerTurnStart(options: {
   cachedAgent?: AgentState | null;
 }): Promise<ListenerTurnStartEmission> {
   try {
-    const modAdapter = ensureListenerModAdapter(options.runtime);
+    const modAdapters = await ensureListenerModAdaptersForAgent(
+      options.runtime,
+      options.agentId,
+    );
     const context = createListenerModContext({
       sessionId: options.conversationId,
       workingDirectory: options.workingDirectory,
@@ -65,7 +69,11 @@ export async function emitListenerTurnStart(options: {
       conversationId: options.conversationId,
       input: options.input,
     };
-    await modAdapter.events.emit("turn_start", event, context);
+    await createListenerModEvents(modAdapters).emit(
+      "turn_start",
+      event,
+      context,
+    );
     const cancel = getTurnStartCancel(event);
     if (cancel) {
       return { cancelled: true, reason: cancel.reason };
@@ -91,7 +99,10 @@ export async function emitListenerTurnEnd(options: {
   cachedAgent?: AgentState | null;
 }): Promise<string | undefined> {
   try {
-    const modAdapter = ensureListenerModAdapter(options.runtime);
+    const modAdapters = await ensureListenerModAdaptersForAgent(
+      options.runtime,
+      options.agentId,
+    );
     const context = createListenerModContext({
       sessionId: options.conversationId,
       workingDirectory: options.workingDirectory,
@@ -110,7 +121,7 @@ export async function emitListenerTurnEnd(options: {
       stopReason: options.stopReason,
       assistantMessage: options.assistantMessage,
     };
-    await modAdapter.events.emit("turn_end", event, context);
+    await createListenerModEvents(modAdapters).emit("turn_end", event, context);
     return typeof event.continue === "string" && event.continue.length > 0
       ? event.continue
       : undefined;
@@ -126,17 +137,10 @@ export function buildMaybeLaunchReflectionSubagent(params: {
   agentId: string;
   conversationId: string;
   reflectionSettings?: ReflectionSettings;
-  cachedAgent?: AgentState | null;
 }): (triggerSource: Exclude<ReflectionTrigger, "off">) => Promise<boolean> {
   return async (triggerSource) => {
-    const {
-      runtime,
-      socket,
-      agentId,
-      conversationId,
-      reflectionSettings,
-      cachedAgent,
-    } = params;
+    const { runtime, socket, agentId, conversationId, reflectionSettings } =
+      params;
 
     if (!agentId) {
       return false;
@@ -150,7 +154,6 @@ export function buildMaybeLaunchReflectionSubagent(params: {
       skipPendingWorktreeReminderScan: triggerSource === "compaction-event",
       reflectionSettings,
       description: AUTO_REFLECTION_DESCRIPTION,
-      systemPrompt: cachedAgent?.system ?? undefined,
       recompileByConversation:
         runtime.listener.systemPromptRecompileByConversation,
       recompileQueuedByConversation:

@@ -79,6 +79,34 @@ describe("connect subcommand", () => {
     setProviderTarget("api");
   });
 
+  test("suggests --backend local for local-only providers on the API backend", async () => {
+    const { stderr, deps } = createIoDeps();
+
+    const exitCode = await runConnectSubcommand(
+      ["ollama", "--base-url", "http://192.168.1.50:11434/v1"],
+      deps,
+    );
+
+    expect(exitCode).toBe(1);
+    const output = stderr.join("\n");
+    expect(output).toContain(
+      'Provider "ollama" is only available with the local backend.',
+    );
+    expect(output).toContain(
+      "letta --backend local connect ollama --base-url http://192.168.1.50:11434/v1",
+    );
+    expect(deps.checkProviderApiKey).not.toHaveBeenCalled();
+  });
+
+  test("still reports unknown providers that exist on no backend", async () => {
+    const { stderr, deps } = createIoDeps();
+
+    const exitCode = await runConnectSubcommand(["not-a-provider"], deps);
+
+    expect(exitCode).toBe(1);
+    expect(stderr.join("\n")).toContain("Unknown provider: not-a-provider.");
+  });
+
   test("runs OAuth flow for codex alias", async () => {
     const { stdout, deps } = createIoDeps();
 
@@ -318,13 +346,21 @@ describe("connect subcommand", () => {
 
   function createLocalOAuthFlowMock() {
     const selections: (string | undefined)[] = [];
+    const connectionOptions: Array<{
+      baseURL?: string;
+      timeout?: number | false;
+    }> = [];
     const runLocalOAuthConnectFlow = mock(
       async (_provider: unknown, callbacks: LocalOAuthConnectCallbacks) => {
         selections.push(await callbacks.onSelect?.(CODEX_LOGIN_SELECT_PROMPT));
+        connectionOptions.push({
+          baseURL: callbacks.baseURL,
+          timeout: callbacks.timeout,
+        });
         return { providerName: "chatgpt-plus-pro" };
       },
     );
-    return { selections, runLocalOAuthConnectFlow };
+    return { selections, connectionOptions, runLocalOAuthConnectFlow };
   }
 
   test("local codex connect defaults to the first login method option", async () => {
@@ -357,6 +393,29 @@ describe("connect subcommand", () => {
     expect(selections).toEqual(["device_code"]);
   });
 
+  test("passes proxy connection options to local OAuth providers", async () => {
+    const { deps } = createIoDeps();
+    setProviderTarget("local");
+    const { connectionOptions, runLocalOAuthConnectFlow } =
+      createLocalOAuthFlowMock();
+
+    const exitCode = await runConnectSubcommand(
+      [
+        "anthropic-oauth",
+        "--base-url",
+        "http://proxy.example.test",
+        "--timeout",
+        "30s",
+      ],
+      { ...deps, runLocalOAuthConnectFlow },
+    );
+
+    expect(exitCode).toBe(0);
+    expect(connectionOptions).toEqual([
+      { baseURL: "http://proxy.example.test", timeout: 30_000 },
+    ]);
+  });
+
   test("local codex connect rejects unknown --method values", async () => {
     const { stderr, deps } = createIoDeps();
     setProviderTarget("local");
@@ -369,7 +428,7 @@ describe("connect subcommand", () => {
 
     expect(exitCode).toBe(1);
     expect(stderr.join("\n")).toContain(
-      "Unknown ChatGPT Plus/Pro (Codex Subscription) login method: carrier-pigeon",
+      "Unknown OpenAI (ChatGPT Plus/Pro) login method: carrier-pigeon",
     );
     expect(stderr.join("\n")).toContain("Available: browser, device_code");
   });

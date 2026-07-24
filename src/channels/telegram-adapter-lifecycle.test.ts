@@ -171,7 +171,7 @@ test("telegram adapter prettifies conversation-busy lifecycle errors", async () 
         run_id: "run-123",
       },
     }),
-    "View agent: \x1b]8;;https://app.letta.com/chat/agent-1?conversation=conv-1\x1b\\agent-1\x1b]8;;\x1b\\ (run: run-123)",
+    "View agent: \x1b]8;;https://chat.letta.com/chat/agent-1?conversation=conv-1\x1b\\agent-1\x1b]8;;\x1b\\ (run: run-123)",
   ].join("\n");
 
   await adapter.start();
@@ -232,7 +232,7 @@ test("telegram lifecycle report button submits sanitized error metadata", async 
         run_id: "run-456",
       },
     }),
-    "View agent: \x1b]8;;https://app.letta.com/chat/agent-1?conversation=conv-1\x1b\\agent-1\x1b]8;;\x1b\\ (run: run-456)",
+    "View agent: \x1b]8;;https://chat.letta.com/chat/agent-1?conversation=conv-1\x1b\\agent-1\x1b]8;;\x1b\\ (run: run-456)",
   ].join("\n");
 
   await adapter.start();

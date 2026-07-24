@@ -4,6 +4,7 @@ import { buildSlackModelPickerBlocks } from "@/channels/slack/model-picker-block
 import type {
   ChannelAdapter,
   ChannelControlRequestEvent,
+  ChannelMessageAttachment,
   ChannelModelPickerData,
   ChannelTurnLifecycleEvent,
   ChannelTurnProgressEvent,
@@ -17,6 +18,8 @@ import {
   createAgentThreadTracker,
 } from "./agent-thread-tracker";
 import { createSlackApprovalController } from "./approval-controller";
+import { downloadSlackAttachmentById } from "./attachment-download";
+import type { SlackAttachmentReadClient } from "./attachment-types";
 import { uploadSlackFile } from "./file-upload";
 import {
   createSlackInboundDebounceController,
@@ -49,15 +52,26 @@ import {
 } from "./utils";
 import { createSlackWebApiClient } from "./web-api-client";
 
+export interface SlackChannelAdapter extends ChannelAdapter {
+  downloadAttachment(params: {
+    attachmentId: string;
+    chatId: string;
+    threadId?: string | null;
+    messageId: string;
+    signal?: AbortSignal;
+  }): Promise<ChannelMessageAttachment>;
+}
+
 export function createSlackAdapter(
   config: SlackChannelAccount,
-): ChannelAdapter {
+): SlackChannelAdapter {
   let app: SlackApp | null = null;
   let writeClient: SlackWriteClient | null = null;
   let writeClientPromise: Promise<SlackWriteClient> | null = null;
   let running = false;
   let botUserId: string | null = null;
-  let adapter: ChannelAdapter;
+  let botId: string | null = null;
+  let adapter: SlackChannelAdapter;
 
   const agentThreadTracker: AgentThreadTracker = createAgentThreadTracker();
   const debounce: SlackInboundDebounceController =
@@ -69,6 +83,7 @@ export function createSlackAdapter(
     config,
     getAdapter: () => adapter,
     getBotUserId: () => botUserId,
+    getBotId: () => botId,
     agentThreadTracker,
     debounce,
   });
@@ -116,6 +131,26 @@ export function createSlackAdapter(
       writeClientPromise = null;
       throw error;
     }
+  }
+
+  async function downloadAttachment(params: {
+    attachmentId: string;
+    chatId: string;
+    threadId?: string | null;
+    messageId: string;
+    signal?: AbortSignal;
+  }): Promise<ChannelMessageAttachment> {
+    const slackApp = await ensureApp();
+    return await downloadSlackAttachmentById({
+      accountId: config.accountId,
+      token: config.botToken,
+      attachmentId: params.attachmentId,
+      channelId: params.chatId,
+      threadTs: params.threadId,
+      messageTs: params.messageId,
+      client: slackApp.client as unknown as SlackAttachmentReadClient,
+      signal: params.signal,
+    });
   }
 
   async function sendLifecycleErrorReply(
@@ -354,7 +389,11 @@ export function createSlackAdapter(
       if (running) return;
       const slackApp = await ensureApp();
       const auth = await slackApp.client.auth.test();
-      botUserId = isNonEmptyString(auth.user_id) ? auth.user_id : null;
+      const authRecord = auth as unknown as Record<string, unknown>;
+      botUserId = isNonEmptyString(authRecord.user_id)
+        ? authRecord.user_id
+        : null;
+      botId = isNonEmptyString(authRecord.bot_id) ? authRecord.bot_id : null;
       await slackApp.start();
       running = true;
       console.log(
@@ -372,6 +411,7 @@ export function createSlackAdapter(
       writeClient = null;
       writeClientPromise = null;
       botUserId = null;
+      botId = null;
       status.clear();
       approvals.clear();
       debounce.clear();
@@ -396,6 +436,7 @@ export function createSlackAdapter(
       );
     },
     sendMessage,
+    downloadAttachment,
     sendDirectReply,
     handleControlRequestEvent,
     prepareInboundMessage: (msg, options) =>

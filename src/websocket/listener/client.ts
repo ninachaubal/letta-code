@@ -22,9 +22,9 @@ import {
 } from "./commands/channels";
 import { handleCronCommand } from "./commands/cron";
 import { handleListMemoryCommand } from "./commands/memory";
+import { buildListModelsEntries } from "./commands/model-catalog";
 import {
   applyModelUpdateForRuntime,
-  buildListModelsEntries,
   buildListModelsResponse,
   buildModelUpdateStatusMessage,
   getCurrentModelStatusForRuntime,
@@ -51,6 +51,7 @@ import {
 } from "./control-inputs";
 import { getOrCreateScopedRuntime } from "./conversation-runtime";
 import {
+  getBootWorkingDirectory,
   getConversationWorkingDirectory,
   setConversationWorkingDirectory,
 } from "./cwd";
@@ -85,12 +86,7 @@ import {
   emitRetryDelta,
   emitStateSync,
 } from "./protocol-outbound";
-import {
-  consumeQueuedTurn,
-  normalizeInboundMessages,
-  normalizeMessageContentImages,
-  scheduleQueuePump,
-} from "./queue";
+import { consumeQueuedTurn, scheduleQueuePump } from "./queue";
 import {
   getApprovalToolCallDesyncErrorText,
   recoverApprovalStateForSync,
@@ -126,6 +122,7 @@ function createLegacyTestRuntime(): ConversationRuntime & {
   socket: WebSocket | null;
   workingDirectoryByConversation: Map<string, string>;
   permissionModeByConversation: ListenerRuntime["permissionModeByConversation"];
+  skillSourcesByConversation: ListenerRuntime["skillSourcesByConversation"];
   reminderStateByConversation: ListenerRuntime["reminderStateByConversation"];
   contextTrackerByConversation: ListenerRuntime["contextTrackerByConversation"];
   systemPromptRecompileByConversation: ListenerRuntime["systemPromptRecompileByConversation"];
@@ -166,6 +163,7 @@ function createLegacyTestRuntime(): ConversationRuntime & {
     socket: WebSocket | null;
     workingDirectoryByConversation: Map<string, string>;
     permissionModeByConversation: ListenerRuntime["permissionModeByConversation"];
+    skillSourcesByConversation: ListenerRuntime["skillSourcesByConversation"];
     reminderStateByConversation: ListenerRuntime["reminderStateByConversation"];
     contextTrackerByConversation: ListenerRuntime["contextTrackerByConversation"];
     systemPromptRecompileByConversation: ListenerRuntime["systemPromptRecompileByConversation"];
@@ -217,6 +215,12 @@ function createLegacyTestRuntime(): ConversationRuntime & {
         listener.permissionModeByConversation = value;
       },
     },
+    skillSourcesByConversation: {
+      get: () => listener.skillSourcesByConversation,
+      set: (value: ListenerRuntime["skillSourcesByConversation"]) => {
+        listener.skillSourcesByConversation = value;
+      },
+    },
     reminderStateByConversation: {
       get: () => listener.reminderStateByConversation,
       set: (value: ListenerRuntime["reminderStateByConversation"]) => {
@@ -244,7 +248,7 @@ function createLegacyTestRuntime(): ConversationRuntime & {
       },
     },
     bootWorkingDirectory: {
-      get: () => listener.bootWorkingDirectory,
+      get: () => getBootWorkingDirectory(listener),
       set: (value: string) => {
         listener.bootWorkingDirectory = value;
       },
@@ -483,8 +487,6 @@ export const __listenClientTestUtils = {
   shouldAttemptPostStopApprovalRecovery,
   markAwaitingAcceptedApprovalContinuationRunId,
   resolveStaleApprovals,
-  normalizeMessageContentImages,
-  normalizeInboundMessages,
   consumeQueuedTurn,
   handleIncomingMessage,
   handleApprovalResponseInput,

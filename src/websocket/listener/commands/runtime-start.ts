@@ -8,6 +8,7 @@ import { getBackend } from "@/backend";
 import { migratePermissionMode } from "@/permissions/mode";
 import { settingsManager } from "@/settings-manager";
 import type { RuntimeScope, RuntimeStartCommand } from "@/types/protocol_v2";
+import { getBootWorkingDirectory } from "@/websocket/listener/cwd";
 import { switchConversationWorkingDirectory } from "@/websocket/listener/cwd-change";
 import { registerRuntimeExternalTools } from "@/websocket/listener/external-tools";
 import {
@@ -197,6 +198,18 @@ async function applyRuntimeStartState(
   scope: RuntimeScope,
   scopedRuntime: ConversationRuntime,
 ): Promise<void> {
+  if (parsed.skill_sources === undefined) {
+    scopedRuntime.skillSources = undefined;
+    context.runtime.skillSourcesByConversation.delete(scopedRuntime.key);
+  } else {
+    const skillSources = [...new Set(parsed.skill_sources)];
+    scopedRuntime.skillSources = skillSources;
+    context.runtime.skillSourcesByConversation.set(
+      scopedRuntime.key,
+      skillSources,
+    );
+  }
+
   if (parsed.mode) {
     const mode = migratePermissionMode(parsed.mode);
     if (!mode) {
@@ -216,7 +229,7 @@ async function applyRuntimeStartState(
       runtime: context.runtime,
       agentId: scope.agent_id,
       conversationId: scope.conversation_id,
-      workingDirectory: parsed.cwd ?? context.runtime.bootWorkingDirectory,
+      workingDirectory: parsed.cwd ?? getBootWorkingDirectory(context.runtime),
       emitStatus: false,
       statusRuntime: scopedRuntime,
       statusSocket: context.socket,

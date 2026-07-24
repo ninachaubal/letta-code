@@ -98,7 +98,19 @@ export interface ChannelMessageAttachment {
   mimeType?: string;
   sizeBytes?: number;
   kind: "image" | "file" | "audio" | "video";
-  localPath: string;
+  /** Local file materialized for tool access. Absent when automatic download was skipped. */
+  localPath?: string;
+  /** Platform message that contains this attachment, used for scoped on-demand downloads. */
+  sourceMessageId?: string;
+  /** Platform thread that contains this attachment, when it is thread-scoped. */
+  sourceThreadId?: string | null;
+  /** Why an attachment discovered on the platform was not downloaded automatically. */
+  downloadReason?:
+    | "exceeds_auto_download_limit"
+    | "missing_download_url"
+    | "download_failed";
+  /** Automatic download threshold that rejected this attachment, when applicable. */
+  autoDownloadLimitBytes?: number;
   imageDataBase64?: string;
   /** Best-effort speech-to-text transcription (voice memos only). */
   transcription?: string;
@@ -270,6 +282,19 @@ export interface ChannelAdapter {
 
   /** Send a message through this channel. */
   sendMessage(msg: OutboundChannelMessage): Promise<{ messageId: string }>;
+
+  /**
+   * Optionally materialize a platform attachment into the channel's local
+   * inbound directory. MessageChannel plugins expose this only when the
+   * adapter can verify the attachment against its canonical source message.
+   */
+  downloadAttachment?(params: {
+    attachmentId: string;
+    chatId: string;
+    threadId?: string | null;
+    messageId: string;
+    signal?: AbortSignal;
+  }): Promise<ChannelMessageAttachment>;
 
   /**
    * Optionally stream an ephemeral rich-message draft while a final rich
@@ -477,7 +502,15 @@ export interface ChannelRoute {
 // ── Config ────────────────────────────────────────────────────────
 
 export type DmPolicy = "pairing" | "allowlist" | "open";
+/**
+ * Group/channel-scope sender policy. "open" preserves the historical
+ * behavior (any participant of an allowed group/channel can talk to the
+ * agent). "allowlist" restricts group senders to allowedUsers/adminUsers,
+ * paired users, and env-var allowlists.
+ */
+export type ChannelGroupSenderPolicy = "open" | "allowlist";
 export type SlackChannelMode = "socket";
+export type SlackAllowBotsMode = false | "mentions";
 export type TelegramGroupMode = "open" | "mention-only";
 export type WhatsAppGroupMode = "disabled" | "mention" | "open";
 export type SignalGroupMode = "disabled" | "mention" | "open";
@@ -493,6 +526,24 @@ interface ChannelAccountBase {
   enabled: boolean;
   dmPolicy: DmPolicy;
   allowedUsers: string[];
+  /**
+   * Sender policy for group/channel-scope messages. Default "open"
+   * (historical behavior). "allowlist" restricts group senders to
+   * allowedUsers/adminUsers, paired users, and env allowlists.
+   * Slack note: dmPolicy "pairing" is a legacy unenforced default and
+   * behaves as "open" for Slack DMs; use "allowlist" to restrict.
+   */
+  groupPolicy?: ChannelGroupSenderPolicy;
+  /**
+   * Admin user IDs for slash-command tiers. When set (non-empty),
+   * command gating activates: non-admins may only run the read-only
+   * floor (/help, /status, /whoami) plus userAllowedCommands. When
+   * unset, every allowed user has full command access (historical
+   * behavior).
+   */
+  adminUsers?: string[];
+  /** Extra slash commands (no leading slash) non-admins may run. */
+  userAllowedCommands?: string[];
   createdAt: string;
   updatedAt: string;
 }
@@ -534,6 +585,12 @@ export interface SlackChannelConfig {
   transcribeVoice?: boolean;
   /** When true, unmentioned Slack thread replies are delivered read-only until an @mention. */
   listenMode?: boolean;
+  /**
+   * Bot-authored inbound policy. Default false drops bot messages. "mentions"
+   * accepts only explicit foreign bot mentions. There is intentionally no
+   * accept-all mode until Letta has a shared pair-loop guard.
+   */
+  allowBots?: SlackAllowBotsMode;
 }
 
 export interface DiscordChannelConfig {
@@ -700,6 +757,12 @@ export interface SlackChannelAccount extends ChannelAccountBase {
   transcribeVoice?: boolean;
   /** When true, unmentioned Slack thread replies are delivered read-only until an @mention. */
   listenMode?: boolean;
+  /**
+   * Bot-authored inbound policy. Default false drops bot messages. "mentions"
+   * accepts only explicit foreign bot mentions. There is intentionally no
+   * accept-all mode until Letta has a shared pair-loop guard.
+   */
+  allowBots?: SlackAllowBotsMode;
   /**
    * Optional debounce window (ms) for inbound messages. When greater than
    * `0`, short back-to-back messages from the same sender in the same

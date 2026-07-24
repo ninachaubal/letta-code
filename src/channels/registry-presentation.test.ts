@@ -4,7 +4,10 @@ import {
   __testOverrideSavePendingControlRequestStore,
   clearPendingControlRequestStore,
 } from "@/channels/pending-control-requests";
-import { buildSlackConversationSummary } from "@/channels/registry-presentation";
+import {
+  buildDirectReplyOptions,
+  buildSlackConversationSummary,
+} from "@/channels/registry-presentation";
 
 beforeEach(() => {
   __testOverrideLoadPendingControlRequestStore(null);
@@ -85,5 +88,34 @@ describe("buildSlackConversationSummary", () => {
         text: "   ",
       }),
     ).toBe("[Slack] Thread C123");
+  });
+});
+
+describe("buildDirectReplyOptions", () => {
+  test("anchors the reply to the user's message, not the thread root", () => {
+    // For bot topics the thread id is the topic root (its creation
+    // message); anchoring replyToMessageId there would reply to the topic
+    // creation message instead of the user's message. threadId still
+    // routes the reply into the topic.
+    expect(
+      buildDirectReplyOptions({
+        messageId: "1712800000.000200",
+        threadId: "1712790000.000050",
+      }),
+    ).toEqual({
+      replyToMessageId: "1712800000.000200",
+      threadId: "1712790000.000050",
+    });
+  });
+
+  test("keeps the thread route when only a thread id is present", () => {
+    expect(buildDirectReplyOptions({ threadId: "42" })).toEqual({
+      replyToMessageId: undefined,
+      threadId: "42",
+    });
+  });
+
+  test("returns undefined without any message context", () => {
+    expect(buildDirectReplyOptions({})).toBeUndefined();
   });
 });

@@ -13,6 +13,7 @@ import { join } from "node:path";
 import { APIError } from "@letta-ai/letta-client/error";
 import WebSocket from "ws";
 import type { ResumeData } from "@/agent/check-approval";
+import { STALE_APPROVAL_RECOVERY_DENIAL_REASON } from "@/agent/turn-recovery-policy";
 import { ChannelRegistry, getChannelRegistry } from "@/channels/registry";
 import type { ChannelAdapter } from "@/channels/types";
 import {
@@ -94,7 +95,6 @@ const sendMessageStreamCalls: Array<{
       clientTools: Array<{ name: string }>;
       loadedToolNames: string[];
     };
-    skipImageNormalization?: boolean;
   };
 }> = [];
 const sendMessageStreamMock = mock(
@@ -334,13 +334,16 @@ function createDeferredDrain() {
 
 async function waitFor(
   predicate: () => boolean,
-  attempts: number = 20,
+  timeoutMs: number = 5_000,
 ): Promise<void> {
-  for (let i = 0; i < attempts; i += 1) {
-    if (predicate()) {
-      return;
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() >= deadline) {
+      throw new Error(
+        `Timed out waiting for test condition after ${timeoutMs}ms`,
+      );
     }
-    await new Promise((resolve) => setTimeout(resolve, 0));
+    await new Promise((resolve) => setTimeout(resolve, 1));
   }
 }
 
@@ -625,7 +628,7 @@ describe("listen-client multi-worker concurrency", () => {
     }
   });
 
-  test("listener turns skip duplicate shared image normalization", async () => {
+  test("listener turns do not bypass send-boundary image normalization", async () => {
     const listener = __listenClientTestUtils.createListenerRuntime();
     const runtime = __listenClientTestUtils.getOrCreateConversationRuntime(
       listener,
@@ -664,9 +667,9 @@ describe("listen-client multi-worker concurrency", () => {
 
     await waitFor(() => sendMessageStreamCalls.length === 1);
 
-    expect(sendMessageStreamCalls[0]?.opts).toMatchObject({
-      skipImageNormalization: true,
-    });
+    expect(sendMessageStreamCalls[0]?.opts).not.toHaveProperty(
+      "skipImageNormalization",
+    );
 
     drain.resolve(defaultDrainResult);
     await turn;
@@ -940,7 +943,7 @@ describe("listen-client multi-worker concurrency", () => {
       processQueuedTurn,
     );
 
-    await waitFor(() => processed.length === 2);
+    await Promise.all([runtimeA.messageQueue, runtimeB.messageQueue]);
 
     expect(processed.sort()).toEqual(["conv-a", "conv-b"]);
     expect(runtimeA.queueRuntime.length).toBe(0);
@@ -1023,7 +1026,7 @@ describe("listen-client multi-worker concurrency", () => {
       },
     );
 
-    await waitFor(() => processed.length === 1);
+    await runtime.messageQueue;
 
     const queuedPayload = processed[0]?.messages[0];
     if (!queuedPayload || !("content" in queuedPayload)) {
@@ -1132,7 +1135,7 @@ describe("listen-client multi-worker concurrency", () => {
       },
     );
 
-    await waitFor(() => processed.length === 1 && lifecycleEvents.length === 2);
+    await runtime.messageQueue;
 
     expect(processed[0]?.channelTurnSources).toEqual(channelTurnSources);
     expect(lifecycleEvents[0]).toEqual({
@@ -1212,9 +1215,7 @@ describe("listen-client multi-worker concurrency", () => {
       },
     );
 
-    await waitFor(
-      () => lifecycleEvents.length === 1 && !runtime.queuePumpActive,
-    );
+    await runtime.messageQueue;
     expect(lifecycleEvents).toEqual([
       {
         type: "processing",
@@ -1296,7 +1297,7 @@ describe("listen-client multi-worker concurrency", () => {
       },
     );
 
-    await waitFor(() => lifecycleEvents.length === 2);
+    await runtime.messageQueue;
 
     expect(lifecycleEvents[1]).toEqual({
       type: "finished",
@@ -1346,7 +1347,7 @@ describe("listen-client multi-worker concurrency", () => {
       },
     );
 
-    await waitFor(() => processed.length === 1);
+    await runtime.messageQueue;
 
     expect(processed[0]).toEqual(
       expect.objectContaining({
@@ -1564,7 +1565,7 @@ describe("listen-client multi-worker concurrency", () => {
             type: "approval",
             tool_call_id: "tool-call-1",
             approve: false,
-            reason: "Auto-denied: stale approval from interrupted session",
+            reason: STALE_APPROVAL_RECOVERY_DENIAL_REASON,
           },
         ],
         otid: expect.any(String),
@@ -1810,19 +1811,19 @@ describe("listen-client multi-worker concurrency", () => {
         type: "approval",
         tool_call_id: autoAllowedApproval.toolCallId,
         approve: false,
-        reason: "Auto-denied: stale approval from interrupted session",
+        reason: STALE_APPROVAL_RECOVERY_DENIAL_REASON,
       },
       {
         type: "approval",
         tool_call_id: manualApproval.toolCallId,
         approve: false,
-        reason: "Auto-denied: stale approval from interrupted session",
+        reason: STALE_APPROVAL_RECOVERY_DENIAL_REASON,
       },
       {
         type: "approval",
         tool_call_id: autoDeniedApproval.toolCallId,
         approve: false,
-        reason: "Auto-denied: stale approval from interrupted session",
+        reason: STALE_APPROVAL_RECOVERY_DENIAL_REASON,
       },
     ]);
     expect(runtime.pendingInterruptedContext).toEqual({
@@ -2105,7 +2106,7 @@ describe("listen-client multi-worker concurrency", () => {
       async () => {},
     );
 
-    await waitFor(() => runtimeB.queueRuntime.length === 0);
+    await runtimeB.messageQueue;
 
     expect(statuses).not.toContain("idle");
     expect(statuses.every((status) => status === "processing")).toBe(true);
@@ -2372,12 +2373,7 @@ describe("listen-client multi-worker concurrency", () => {
           batch.batchId,
         ),
     );
-    await waitFor(
-      () =>
-        runtime.queueRuntime.length === 0 &&
-        runtime.turnLifecycle.kind === "idle" &&
-        sendMessageStreamMock.mock.calls.length === 2,
-    );
+    await runtime.messageQueue;
 
     expect(JSON.stringify(sendMessageStreamMock.mock.calls[1]?.[1])).toContain(
       "follow up",

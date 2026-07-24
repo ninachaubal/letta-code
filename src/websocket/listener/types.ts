@@ -5,6 +5,7 @@ import type {
   ApprovalDecision,
   ApprovalResult,
 } from "@/agent/approval-execution";
+import type { SkillSource } from "@/agent/skill-sources";
 import type { ChannelTurnSource } from "@/channels/types";
 import type { ContextTracker } from "@/cli/helpers/context-tracker";
 import type { ApprovalRequest } from "@/cli/helpers/stream";
@@ -63,6 +64,8 @@ export interface IncomingMessage {
   type: "message";
   agentId?: string;
   conversationId?: string;
+  /** Queue this message as its own turn; never merge with other messages. */
+  noCoalesce?: boolean;
   channelTurnSources?: ChannelTurnSource[];
   clientToolAllowlist?: string[];
   externalToolScopeIds?: string[];
@@ -84,6 +87,22 @@ export type ProcessQueuedTurn = (
   queuedTurn: IncomingMessage,
   dequeuedBatch: DequeuedBatch,
 ) => Promise<void>;
+
+/**
+ * An outbound v2 protocol message as delivered to in-process stream
+ * observers: the pre-envelope message payload plus its resolved runtime
+ * scope (agent/conversation) and optional subagent attribution.
+ */
+export interface ObservedProtocolV2Message {
+  type: string;
+  runtime: { agent_id?: string | null; conversation_id?: string | null };
+  subagent_id?: string;
+  [key: string]: unknown;
+}
+
+export type ListenerStreamObserver = (
+  message: ObservedProtocolV2Message,
+) => void;
 
 export interface PendingExternalToolCall {
   resolve: (result: ExternalToolCallResult) => void;
@@ -142,6 +161,8 @@ export type ConversationRuntime = {
   key: string;
   agentId: string | null;
   conversationId: string;
+  /** Runtime-scoped SDK override. Undefined uses the process defaults. */
+  skillSources: SkillSource[] | undefined;
   activeChannelTurn: ActiveChannelTurn | null;
   turnLifecycle: TurnLifecycle;
   messageQueue: Promise<void>;
@@ -197,8 +218,12 @@ export type ListenerRuntime = {
   hasSuccessfulConnection: boolean;
   /** True once the WS has connected at least once. Never reset to false. */
   everConnected: boolean;
-  /** Provider-only local mod adapter for desktop/listener surfaces. */
+  /** Global local mod adapter for desktop/listener surfaces. */
   modAdapter?: ModAdapter | undefined;
+  /** Isolated agent-scoped adapters loaded from each agent's MemFS. */
+  agentModAdapters?: Map<string, ModAdapter>;
+  /** Coalesces concurrent first-loads for one agent's scoped adapter. */
+  agentModAdapterLoads?: Map<string, Promise<ModAdapter | null>>;
   sessionId: string;
   eventSeqCounter: number;
   queueEmitScheduled: boolean;
@@ -210,11 +235,15 @@ export type ListenerRuntime = {
   reminderState: SharedReminderState;
   bootWorkingDirectory: string;
   workingDirectoryByConversation: Map<string, string>;
+  /** Monotonic signal for cwd changes and rejected stale cwd requests. */
+  workingDirectoryRevision?: number;
   /** Per-conversation permission mode state. Mirrors workingDirectoryByConversation. */
   permissionModeByConversation: Map<
     string,
     import("@/websocket/listener/permission-mode").ConversationPermissionModeState
   >;
+  /** Per-conversation skill overrides survive idle ConversationRuntime eviction. */
+  skillSourcesByConversation: Map<string, SkillSource[]>;
   /** Per-conversation reminder state survives ConversationRuntime eviction. */
   reminderStateByConversation: Map<string, SharedReminderState>;
   /** Per-conversation context tracker survives ConversationRuntime eviction. */
@@ -232,7 +261,7 @@ export type ListenerRuntime = {
     import("@/websocket/listener/worktree-watcher").WorktreeWatcherState
   >;
   /** Agent IDs whose memfs repo has been cloned/pulled this session. Concurrent callers coalesce on the same promise. */
-  memfsSyncedAgents: Map<string, Promise<void>>;
+  memfsSyncedAgents: Map<string, Promise<boolean>>;
   /** Agent IDs with an in-flight secrets refresh. Concurrent callers coalesce on the same promise. */
   secretsHydrationByAgent: Map<string, Promise<void>>;
   /** Per-agent timestamp of the last successful secrets hydration. Used for freshness-based caching. */
@@ -254,6 +283,13 @@ export type ListenerRuntime = {
     } | null>
   >;
   lastEmittedStatus: "idle" | "receiving" | "processing" | null;
+  /**
+   * In-process observers of outbound v2 protocol messages (e.g. the
+   * OpenAI-compat HTTP bridge). Each observer receives every emitted message
+   * with its resolved runtime scope, independent of socket routing, so
+   * protocol consumers can exist without owning a WebSocket.
+   */
+  streamObservers?: Set<ListenerStreamObserver>;
   /** Unsubscribe from subagent state store (set on socket open, cleared on close). */
   _unsubscribeSubagentState?: (() => void) | undefined;
   /** Unsubscribe from subagent stream events (set on socket open, cleared on close). */

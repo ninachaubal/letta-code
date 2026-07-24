@@ -8,8 +8,10 @@ import {
   type SetStateAction,
   useCallback,
 } from "react";
+import { getCachedModelReasoningCapabilities } from "@/agent/available-models";
 import {
   type ModelReasoningEffort,
+  preservableContextWindow,
   shouldPreserveContextWindowForModelSelection,
 } from "@/agent/model";
 import { applyPersonalityToMemory } from "@/agent/personality";
@@ -189,6 +191,7 @@ export function useConfigurationHandlers(ctx: ConfigurationHandlersContext) {
       try {
         const {
           getChatGptFastRegistryHandleForModelHandle,
+          getPreferredReasoningOption: pref,
           getReasoningTierOptionsForHandle,
           normalizeModelHandleForRegistry,
           models,
@@ -345,12 +348,14 @@ export function useConfigurationHandlers(ctx: ConfigurationHandlersContext) {
             : modelUpdateArgs?.enable_reasoner === false
               ? "no"
               : null;
-        const selectedContextWindow = (
-          model.updateArgs as { context_window?: number } | undefined
-        )?.context_window;
+        const selectedContextWindow =
+          Number(model.updateArgs?.context_window) || undefined;
+        const reasoningCapabilities =
+          getCachedModelReasoningCapabilities()?.get(modelHandle);
         const reasoningTierOptions = getReasoningTierOptionsForHandle(
           registryHandle,
           selectedContextWindow,
+          reasoningCapabilities,
         ).map((option) => {
           const optionModel = models.find(
             (entry) => entry.id === option.modelId,
@@ -361,6 +366,7 @@ export function useConfigurationHandlers(ctx: ConfigurationHandlersContext) {
             ...((optionModel?.updateArgs as
               | Record<string, unknown>
               | undefined) ?? {}),
+            reasoning_effort: option.effort,
             ...(serviceTier !== undefined ? { service_tier: serviceTier } : {}),
             ...(providerType ? { provider_type: providerType } : {}),
           };
@@ -376,7 +382,6 @@ export function useConfigurationHandlers(ctx: ConfigurationHandlersContext) {
             },
           };
         });
-
         if (
           !opts?.skipReasoningPrompt &&
           (opts?.promptReasoning || activeOverlay === "model") &&
@@ -385,13 +390,7 @@ export function useConfigurationHandlers(ctx: ConfigurationHandlersContext) {
           const selectedEffort = (
             model.updateArgs as { reasoning_effort?: unknown } | undefined
           )?.reasoning_effort;
-          const preferredOption =
-            (typeof selectedEffort === "string" &&
-              reasoningTierOptions.find(
-                (option) => option.effort === selectedEffort,
-              )) ??
-            reasoningTierOptions.find((option) => option.effort === "medium") ??
-            reasoningTierOptions[0];
+          const preferredOption = pref(reasoningTierOptions, selectedEffort);
 
           if (preferredOption) {
             setModelReasoningPrompt({
@@ -428,6 +427,16 @@ export function useConfigurationHandlers(ctx: ConfigurationHandlersContext) {
           return;
         }
 
+        // Switching to a different model (or a different context-window
+        // variant of the same model, e.g. base <-> 1M dual listings) resets
+        // the context window to the selected catalog entry's preset. Only a
+        // tier change within the same variant preserves the current window —
+        // and it preserves by RE-SENDING the current value explicitly, never
+        // by omitting the field: the server treats an omitted
+        // context_window_limit as "re-derive from the handle" and clamps it
+        // to a legacy global default (128k). A current value that looks like
+        // that clamp is not preservable, so poisoned agents heal to the
+        // preset even on same-variant tier changes. See LET-9786.
         const currentLlmConfig = llmConfigRef.current;
         const shouldPreserveContextWindow =
           shouldPreserveContextWindowForModelSelection({
@@ -437,12 +446,19 @@ export function useConfigurationHandlers(ctx: ConfigurationHandlersContext) {
             selectedModelHandle: modelHandle,
             selectedContextWindow,
           });
+        const preservedContextWindow = shouldPreserveContextWindow
+          ? preservableContextWindow(
+              currentLlmConfig?.context_window,
+              modelHandle,
+            )
+          : undefined;
         const modelUpdateArgsForRequest = model.updateArgs
           ? { ...(model.updateArgs as Record<string, unknown>) }
           : undefined;
-        if (shouldPreserveContextWindow && modelUpdateArgsForRequest) {
-          delete modelUpdateArgsForRequest.context_window;
-        }
+        const updateOptions =
+          preservedContextWindow !== undefined
+            ? { contextWindowOverride: preservedContextWindow }
+            : undefined;
 
         await withCommandLock(async () => {
           const cmd =
@@ -472,10 +488,7 @@ export function useConfigurationHandlers(ctx: ConfigurationHandlersContext) {
               agentIdRef.current,
               modelHandle,
               modelUpdateArgsForRequest,
-              {
-                avoidOverwritingExistingContextWindow:
-                  shouldPreserveContextWindow,
-              },
+              updateOptions,
             );
             conversationModelSettings = updatedAgent?.model_settings;
           } else {
@@ -486,10 +499,7 @@ export function useConfigurationHandlers(ctx: ConfigurationHandlersContext) {
               conversationIdRef.current,
               modelHandle,
               modelUpdateArgsForRequest,
-              {
-                avoidOverwritingExistingContextWindow:
-                  shouldPreserveContextWindow,
-              },
+              updateOptions,
             );
             conversationModelSettings = (
               updatedConversation as {
@@ -529,16 +539,13 @@ export function useConfigurationHandlers(ctx: ConfigurationHandlersContext) {
           }
 
           const presetContextWindow = modelUpdateArgsForRequest?.context_window;
-          const preservedContextWindow = llmConfigRef.current?.context_window;
           const resolvedContextWindow =
             typeof conversationContextWindowLimit === "number"
               ? conversationContextWindowLimit
-              : shouldPreserveContextWindow &&
-                  typeof preservedContextWindow === "number"
-                ? preservedContextWindow
-                : typeof presetContextWindow === "number"
+              : (preservedContextWindow ??
+                (typeof presetContextWindow === "number"
                   ? presetContextWindow
-                  : undefined;
+                  : undefined));
           const resolvedProviderType =
             providerTypeFromModelSettings(conversationModelSettings) ??
             providerTypeFromUpdateArgs(modelUpdateArgsForRequest) ??

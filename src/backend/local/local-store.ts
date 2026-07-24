@@ -32,6 +32,7 @@ import type {
 import { INTERRUPTED_BY_USER } from "@/constants";
 import { isRecord } from "@/utils/type-guards";
 import type { LocalCompactionStats } from "./compaction";
+import { listLocalConversations } from "./local-conversation-list";
 import {
   emptyLocalUsage,
   type LocalAssistantMessage,
@@ -1489,28 +1490,8 @@ export class LocalStore {
   listConversations(body?: ConversationListBody): Conversation[] {
     this.loadConversationRecordsFromStorage();
     this.refreshLoadedConversationRecordsFromStorage();
-    const bodyRecord = (body ?? {}) as Record<string, unknown>;
-    const agentId = optionalString(bodyRecord.agent_id);
-    const after = optionalString(bodyRecord.after);
-    const limit = typeof bodyRecord.limit === "number" ? bodyRecord.limit : 20;
-    let conversations = [...this.conversations.values()].filter(
-      (conversation) =>
-        conversation.id !== "default" &&
-        (bodyRecord.include_hidden === true || !conversation.hidden) &&
-        (!agentId || conversation.agent_id === agentId),
-    );
-    conversations.sort((a, b) => {
-      const aDate = a.last_message_at ?? a.updated_at ?? a.created_at ?? "";
-      const bDate = b.last_message_at ?? b.updated_at ?? b.created_at ?? "";
-      return bDate.localeCompare(aDate);
-    });
-    if (after) {
-      const afterIndex = conversations.findIndex(
-        (conversation) => conversation.id === after,
-      );
-      if (afterIndex >= 0) conversations = conversations.slice(afterIndex + 1);
-    }
-    return conversations.slice(0, limit);
+
+    return listLocalConversations(this.conversations.values(), body);
   }
 
   createConversation(body: ConversationCreateBody): Conversation {
@@ -1520,11 +1501,13 @@ export class LocalStore {
     }
     this.ensureAgent(agentId);
     const conversationId = this.nextConversationId();
-    const conversation = createLocalConversationRecord(
-      conversationId,
-      agentId,
-      this.conversationSeq,
-      body,
+    const conversation = this.withConversationModelDefaults(
+      createLocalConversationRecord(
+        conversationId,
+        agentId,
+        this.conversationSeq,
+        body,
+      ),
     );
     const key = this.conversationKey(conversation.id, agentId);
     this.conversations.set(key, conversation);
@@ -1553,11 +1536,7 @@ export class LocalStore {
         body,
         currentIsoTimestamp(),
       );
-      const projected = this.applyConversationModelDefaults(
-        updated,
-        body,
-        created,
-      );
+      const projected = this.withConversationModelDefaults(updated);
       this.conversations.set(
         this.conversationKey(conversationId, created.agent_id),
         projected,
@@ -1565,10 +1544,8 @@ export class LocalStore {
       this.persistConversationState(conversationId, created.agent_id);
       return projected;
     }
-    const updated = this.applyConversationModelDefaults(
+    const updated = this.withConversationModelDefaults(
       updateLocalConversationRecord(current, body, currentIsoTimestamp()),
-      body,
-      current,
     );
     this.conversations.set(
       this.conversationKey(conversationId, current.agent_id),
@@ -1578,19 +1555,15 @@ export class LocalStore {
     return updated;
   }
 
-  private applyConversationModelDefaults(
+  private withConversationModelDefaults(
     conversation: StoredConversation,
-    body: ConversationUpdateBody,
-    previousConversation: StoredConversation,
   ): StoredConversation {
-    const requestedModel = (body as Record<string, unknown>).model;
+    const requestedModel = conversation.model;
     if (typeof requestedModel !== "string") return conversation;
     const normalizedRequestedModel = normalizeLocalModelHandle(
       requestedModel,
       isRecord(conversation.model_settings) ? conversation.model_settings : {},
     );
-    if (previousConversation.model === normalizedRequestedModel)
-      return conversation;
     const defaults = this.modelSettingsDefaultsForModel(
       normalizedRequestedModel,
     );
@@ -1600,9 +1573,10 @@ export class LocalStore {
       : {};
     return {
       ...conversation,
+      model: normalizedRequestedModel,
       model_settings: {
-        ...existingSettings,
         ...defaults,
+        ...existingSettings,
       },
     };
   }
@@ -1946,11 +1920,11 @@ export class LocalStore {
     message: Record<string, unknown>,
   ): LocalMessage {
     const conversation = this.ensureConversation(conversationId, agentId);
-    const id = this.nextLocalMessageId();
     const date = this.currentLocalMessageDate();
     const localMessage: LocalMessage = {
-      id,
+      id: this.nextLocalMessageId(),
       role: "user",
+      otid: optionalString(message.otid ?? message.client_message_id),
       metadata: {
         created_at: date,
         updated_at: date,
@@ -3005,7 +2979,9 @@ export class LocalStore {
     const existing = this.conversations.get(key);
     if (existing && options.forceRefresh !== true) return existing;
 
-    const normalizedInput = normalizeStoredLocalModelRecord(input);
+    const normalizedInput = this.withConversationModelDefaults(
+      normalizeStoredLocalModelRecord(input),
+    );
     const timing = transcriptTimingForConversationDir(conversationDir);
     const requiresFullTimestampRepair =
       isSyntheticLocalTimestamp(normalizedInput.created_at) ||

@@ -97,6 +97,10 @@ export type ModConversationMessage = MessageCreate | ApprovalCreate;
 export interface ModConversationSendMessageOptions {
   background?: boolean;
   overrideModel?: string;
+  /**
+   * @deprecated Image normalization is always enforced at the send boundary.
+   * This option is retained as an ignored compatibility shim for existing mods.
+   */
   skipImageNormalization?: boolean;
   streamTokens?: boolean;
   workingDirectory?: string;
@@ -145,7 +149,7 @@ export interface ModConversationHandle {
   /**
    * Update the model, reasoning effort, and/or context window for this
    * conversation (or the agent default with scope: "agent"). Only the fields you
-   * pass change; others are preserved. Works for local and constellation agents.
+   * pass change; others are preserved. Works for local and cloud agents.
    */
   updateLlmConfig: (options: ModUpdateLlmConfigOptions) => Promise<void>;
 }

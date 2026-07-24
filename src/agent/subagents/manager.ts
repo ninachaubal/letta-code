@@ -34,6 +34,7 @@ import {
 import { settingsManager } from "@/settings-manager";
 import { debugLog, debugWarn } from "@/utils/debug";
 import { getErrorMessage } from "@/utils/error";
+import { isSubagentStdoutLostError } from "@/utils/subagent-stdout-failure";
 import {
   getAllSubagentConfigs,
   type SubagentConfig,
@@ -59,6 +60,7 @@ import {
 } from "./subagent-model";
 import {
   type ExecutionState,
+  looksLikeTruncatedStreamJson,
   parseResultFromStdout,
   processStreamEvent,
 } from "./subagent-stream";
@@ -200,6 +202,11 @@ interface BuildSubagentArgsOptions {
   promptTransport?: "argv" | "stdin";
   extraTools?: string[];
   parentAgentId?: string | null;
+  /**
+   * Replace the subagent's configured persona: pass `--system-custom <text>`
+   * to the child instead of `--system <type>`. Only applies to new agents.
+   */
+  systemPromptOverride?: string;
 }
 
 /**
@@ -237,8 +244,14 @@ export function buildSubagentArgs(
     // Don't pass --system (existing agent keeps its prompt)
     // Don't pass --model (existing agent keeps its model)
   } else {
-    // Create new agent (original behavior)
-    args.push("--new-agent", "--system", type);
+    // Create new agent (original behavior). A systemPromptOverride replaces the
+    // configured persona with a caller-supplied prompt via `--system-custom`
+    // (mutually exclusive with `--system`).
+    if (options.systemPromptOverride) {
+      args.push("--new-agent", "--system-custom", options.systemPromptOverride);
+    } else {
+      args.push("--new-agent", "--system", type);
+    }
     const subagentTags = [`type:${type}`];
     if (options.parentAgentId) {
       subagentTags.push(`parent:${options.parentAgentId}`);
@@ -326,7 +339,6 @@ async function executeSubagent(
   config: SubagentConfig,
   model: string | null,
   userPrompt: string,
-  baseURL: string,
   subagentId: string,
   isRetry = false,
   signal?: AbortSignal,
@@ -336,6 +348,7 @@ async function executeSubagent(
   parentAgentIdOverride?: string,
   transcriptPath?: string,
   memoryScope?: SubagentMemoryScope,
+  systemPromptOverride?: string,
 ): Promise<SubagentResult> {
   // Check if already aborted before starting
   if (signal?.aborted) {
@@ -387,6 +400,7 @@ async function executeSubagent(
           config.fork && inheritedChannelContext
             ? ["MessageChannel"]
             : undefined,
+        systemPromptOverride,
       },
     );
 
@@ -559,7 +573,6 @@ async function executeSubagent(
             config,
             primaryModel,
             userPrompt,
-            baseURL,
             subagentId,
             true, // Mark as retry to prevent infinite loops
             signal,
@@ -570,6 +583,32 @@ async function executeSubagent(
             transcriptPath,
           );
         }
+      }
+
+      // The child lost its stdout stream before it could deliver the result
+      // envelope (it exits non-zero with a marker on stderr). The stream is
+      // gone but the payload is retryable — respawn once.
+      if (!isRetry && isSubagentStdoutLostError(stderr)) {
+        debugWarn(
+          "subagent",
+          `Subagent ${subagentId} lost stdout before its result envelope; retrying once`,
+        );
+        return executeSubagent(
+          type,
+          config,
+          model,
+          userPrompt,
+          subagentId,
+          true, // Mark as retry to prevent infinite loops
+          signal,
+          existingAgentId,
+          existingConversationId,
+          maxTurns,
+          parentAgentIdOverride,
+          transcriptPath,
+          memoryScope,
+          systemPromptOverride,
+        );
       }
 
       const propagatedError = state.finalError?.trim();
@@ -639,6 +678,34 @@ async function executeSubagent(
         `parseResultFromStdout failed for ${subagentId}: ${result.error}. ` +
           `stdout first 500 chars: ${stdout.slice(0, 500)}`,
       );
+      // A clean exit whose stream ends mid-line means the result envelope was
+      // truncated in transit even though the child believed it succeeded
+      // (observed under high parallel fan-out, #3257) — respawn once instead
+      // of dropping the response. Other parse failures (e.g. well-formed but
+      // unexpected output) are not retried: the child may have already
+      // performed side effects, so only unambiguous truncation is worth it.
+      if (!isRetry && looksLikeTruncatedStreamJson(stdout)) {
+        debugWarn(
+          "subagent",
+          `Subagent ${subagentId} stdout ends mid-line with no result envelope; retrying once`,
+        );
+        return executeSubagent(
+          type,
+          config,
+          model,
+          userPrompt,
+          subagentId,
+          true, // Mark as retry to prevent infinite loops
+          signal,
+          existingAgentId,
+          existingConversationId,
+          maxTurns,
+          parentAgentIdOverride,
+          transcriptPath,
+          memoryScope,
+          systemPromptOverride,
+        );
+      }
     }
     return result;
   } catch (error) {
@@ -649,25 +716,6 @@ async function executeSubagent(
       error: getErrorMessage(error),
     };
   }
-}
-
-/**
- * Get the base URL for constructing agent links
- */
-function getBaseURL(): string {
-  const settings = settingsManager.getSettings();
-
-  const baseURL =
-    process.env.LETTA_BASE_URL ||
-    settings.env?.LETTA_BASE_URL ||
-    "https://api.letta.com";
-
-  // Convert API URL to web UI URL if using hosted service
-  if (baseURL === "https://api.letta.com") {
-    return "https://app.letta.com";
-  }
-
-  return baseURL;
 }
 
 /**
@@ -757,6 +805,7 @@ export async function spawnSubagent(
   transcriptPath?: string,
   parentConversationId?: string,
   memoryScope?: SubagentMemoryScope,
+  systemPromptOverride?: string,
 ): Promise<SubagentResult> {
   const allConfigs = await getAllSubagentConfigs();
   const config = allConfigs[type];
@@ -814,8 +863,6 @@ export async function spawnSubagent(
         subagentType: type,
         backendMode,
       });
-  const baseURL = getBaseURL();
-
   // Build the prompt with system reminder for deployed agents
   let finalPrompt = prompt;
   if (isDeployingExisting && resolvedParentAgentId) {
@@ -848,7 +895,10 @@ export async function spawnSubagent(
     const forkAgentURL = buildAgentReference(existingAgentId, {
       conversationId: existingConversationId,
     });
-    updateSubagent(subagentId, { agentURL: forkAgentURL });
+    updateSubagent(subagentId, {
+      agentURL: forkAgentURL,
+      conversationId: existingConversationId,
+    });
   }
 
   // Execute subagent - state updates are handled via the state store
@@ -857,7 +907,6 @@ export async function spawnSubagent(
     config,
     model,
     finalPrompt,
-    baseURL,
     subagentId,
     false,
     signal,
@@ -867,6 +916,7 @@ export async function spawnSubagent(
     resolvedParentAgentId,
     transcriptPath,
     memoryScope,
+    systemPromptOverride,
   );
 
   return result;

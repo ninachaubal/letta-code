@@ -51,10 +51,6 @@ import type {
   ModToolStartEvent,
   ToolApprovalPolicy,
 } from "@/mods/types";
-import {
-  permissionMode as globalPermissionMode,
-  type PermissionMode,
-} from "@/permissions/mode";
 import type {
   PermissionDecision,
   PermissionRuleType,
@@ -72,12 +68,17 @@ import { debugLog } from "@/utils/debug";
 import { refreshAndListSecrets } from "@/utils/secrets-store";
 import { isRecord } from "@/utils/type-guards";
 import { toolFilter } from "./filter";
+import { clampToolReturnContent } from "./impl/tool-return-clamp";
 import {
   functionToolForm,
   type JsonSchema,
   type ModelFacingToolForm,
   serializeFunctionOnlyToolPayload,
 } from "./model-facing-tool";
+import {
+  getEffectivePermissionModeState,
+  type PermissionModeState,
+} from "./permission-mode-state";
 import {
   extractSecretEnvFromCommand,
   scrubSecretsFromString,
@@ -675,15 +676,6 @@ function getSwitchLock(): SwitchLockState {
 const toolRegistry = getRegistry();
 let toolExecutionContextCounter = 0;
 
-/**
- * Mutable, shared-by-reference permission mode state.
- * Listener mode populates this from ConversationRuntime; CLI mode uses a
- * wrapper around the global permissionMode singleton.
- */
-export type PermissionModeState = {
-  mode: PermissionMode;
-};
-
 type ToolExecutionContextSnapshot = {
   toolRegistry: ToolRegistry;
   externalTools: Map<string, ExternalToolDefinition>;
@@ -1062,7 +1054,10 @@ export async function executeExternalTool(
       .join("\n");
 
     return {
-      toolReturn: textContent || JSON.stringify(result.content),
+      toolReturn: clampToolReturnContent(
+        textContent || JSON.stringify(result.content),
+        toolName,
+      ),
       status: result.isError ? "error" : "success",
     };
   } catch (error) {
@@ -1120,23 +1115,6 @@ function buildClientToolsFromSnapshot(
   }));
 
   return [...builtInTools, ...externalClientTools, ...modClientTools];
-}
-
-function getEffectivePermissionModeState(
-  permissionModeState?: PermissionModeState,
-): PermissionModeState {
-  // When no scoped state is provided (local/CLI mode), create a live proxy to
-  // the global singleton.
-  return (
-    permissionModeState ?? {
-      get mode() {
-        return globalPermissionMode.getMode();
-      },
-      set mode(value: PermissionMode) {
-        globalPermissionMode.setMode(value);
-      },
-    }
-  );
 }
 
 function capturePreparedToolExecutionContext(
@@ -1256,6 +1234,8 @@ export async function prepareCurrentToolExecutionContext(options?: {
   channelTurnSources?: ChannelTurnSource[];
   modContext?: ModContext;
   modEvents?: ModEvents;
+  modPermissions?: Map<string, ModPermissionDefinition>;
+  modTools?: Map<string, ModToolDefinition>;
 }): Promise<PreparedToolExecutionContext> {
   await waitForToolsetReady();
   const currentToolNames = maybeAppendChannelTools(
@@ -1270,8 +1250,11 @@ export async function prepareCurrentToolExecutionContext(options?: {
       externalExecutor: getExternalToolExecutor(),
       modContext: options?.modContext,
       modEvents: options?.modEvents,
-      modPermissions: getAvailableModPermissionsRegistry(options?.modContext),
-      modTools: getAvailableModToolsRegistry(options?.modContext),
+      modPermissions:
+        options?.modPermissions ??
+        getAvailableModPermissionsRegistry(options?.modContext),
+      modTools:
+        options?.modTools ?? getAvailableModToolsRegistry(options?.modContext),
     },
     options,
   );
@@ -1288,6 +1271,8 @@ export async function prepareToolExecutionContextForSpecificTools(
     channelTurnSources?: ChannelTurnSource[];
     modContext?: ModContext;
     modEvents?: ModEvents;
+    modPermissions?: Map<string, ModPermissionDefinition>;
+    modTools?: Map<string, ModToolDefinition>;
     runtimeContext?: Partial<RuntimeContextSnapshot>;
   },
 ): Promise<PreparedToolExecutionContext> {
@@ -1302,8 +1287,11 @@ export async function prepareToolExecutionContextForSpecificTools(
       externalExecutor: getExternalToolExecutor(),
       modContext: options?.modContext,
       modEvents: options?.modEvents,
-      modPermissions: getAvailableModPermissionsRegistry(options?.modContext),
-      modTools: getAvailableModToolsRegistry(options?.modContext),
+      modPermissions:
+        options?.modPermissions ??
+        getAvailableModPermissionsRegistry(options?.modContext),
+      modTools:
+        options?.modTools ?? getAvailableModToolsRegistry(options?.modContext),
     },
     options,
   );
@@ -1322,6 +1310,8 @@ export async function prepareToolExecutionContextForModel(
     channelTurnSources?: ChannelTurnSource[];
     modContext?: ModContext;
     modEvents?: ModEvents;
+    modPermissions?: Map<string, ModPermissionDefinition>;
+    modTools?: Map<string, ModToolDefinition>;
     runtimeContext?: Partial<RuntimeContextSnapshot>;
   },
 ): Promise<PreparedToolExecutionContext> {
@@ -1336,8 +1326,11 @@ export async function prepareToolExecutionContextForModel(
       externalExecutor: getExternalToolExecutor(),
       modContext: options?.modContext,
       modEvents: options?.modEvents,
-      modPermissions: getAvailableModPermissionsRegistry(options?.modContext),
-      modTools: getAvailableModToolsRegistry(options?.modContext),
+      modPermissions:
+        options?.modPermissions ??
+        getAvailableModPermissionsRegistry(options?.modContext),
+      modTools:
+        options?.modTools ?? getAvailableModToolsRegistry(options?.modContext),
     },
     options,
   );
@@ -2481,10 +2474,13 @@ async function executeModTool(
         redactions,
       );
       const toolStatus = getModToolStatus(result);
-      const flattenedResponse = scrubModToolReturnContent(
-        flattenToolResponse(result),
-        options.scopedAgentId,
-        redactions,
+      const flattenedResponse = clampToolReturnContent(
+        scrubModToolReturnContent(
+          flattenToolResponse(result),
+          options.scopedAgentId,
+          redactions,
+        ),
+        toolName,
       );
       const responseSize =
         typeof flattenedResponse === "string"
@@ -2763,20 +2759,8 @@ async function executeToolInner(
   }
 
   const internalName = resolveInternalToolName(name, activeRegistry);
-  if (!internalName) {
-    const availableTools = [
-      ...Array.from(activeRegistry.keys()),
-      ...Array.from(activeExternalTools.keys()),
-      ...Array.from(activeModTools.keys()),
-    ];
-    return {
-      toolReturn: `Tool not found: ${name}. Available tools: ${availableTools.join(", ")}`,
-      status: "error",
-    };
-  }
-
-  const tool = activeRegistry.get(internalName);
-  if (!tool) {
+  const tool = internalName ? activeRegistry.get(internalName) : undefined;
+  if (!internalName || !tool) {
     const availableTools = [
       ...Array.from(activeRegistry.keys()),
       ...Array.from(activeExternalTools.keys()),
@@ -2996,6 +2980,11 @@ async function executeToolInner(
         }
       }
 
+      flattenedResponse = clampToolReturnContent(
+        flattenedResponse,
+        internalName,
+      );
+
       // Track tool usage (calculate size for multimodal content)
       const responseSize =
         typeof flattenedResponse === "string"
@@ -3034,7 +3023,6 @@ async function executeToolInner(
         hookFeedback,
       );
 
-      // Return the full response (truncation happens in UI layer only)
       return {
         toolReturn: finalToolReturn,
         status: toolStatus,

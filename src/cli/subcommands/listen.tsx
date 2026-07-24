@@ -10,12 +10,6 @@ import { Box, render, Text } from "ink";
 import TextInput from "ink-text-input";
 import type React from "react";
 import { useState } from "react";
-import {
-  LETTA_CLOUD_API_URL,
-  pollForToken,
-  refreshAccessToken,
-  requestDeviceCode,
-} from "@/auth/oauth";
 import { isLocalBackendEnvEnabled } from "@/backend/local/paths";
 import {
   type ChannelRestoreAgentScope,
@@ -29,12 +23,24 @@ import { settingsManager } from "@/settings-manager";
 import { getListenerTelemetrySurface, telemetry } from "@/telemetry";
 import { RemoteSessionLog } from "@/websocket/listen-log";
 import {
-  deriveListenerInstanceId,
   type RegisterOptions,
   registerWithCloudRetry,
 } from "@/websocket/listen-register";
-
-const LISTENER_TOKEN_REFRESH_WINDOW_MS = 5 * 60 * 1000;
+import {
+  getListenerServerUrl,
+  isCloudListenerServerUrl,
+  MissingListenerApiKeyError,
+  resolveListenerRegistrationOptions,
+} from "@/websocket/listener/auth";
+import { getSpawnerListenerInstanceId } from "@/websocket/listener/identity";
+import {
+  acquireManualListenerLock,
+  ManualListenerAlreadyRunningError,
+  type ManualListenerLockHandle,
+  ManualListenerLockUnavailableError,
+  shouldAcquireManualListenerLock,
+} from "@/websocket/listener/manual-instance-lock";
+import { flushRemoteSettingsWrites } from "@/websocket/listener/remote-settings";
 
 type ListenerProcessAnchor = {
   close: () => void;
@@ -46,33 +52,6 @@ type CreateListenerProcessAnchor = () => ListenerProcessAnchor;
 // Without a retained reference, the MessageChannel anchor could be garbage
 // collected even though it is intended to hold channel-only listeners open.
 const activeListenerProcessAnchors = new Set<ListenerProcessAnchor>();
-
-type ListenerOAuthDeps = {
-  LETTA_CLOUD_API_URL: string;
-  pollForToken: typeof pollForToken;
-  refreshAccessToken: typeof refreshAccessToken;
-  requestDeviceCode: typeof requestDeviceCode;
-};
-
-const defaultListenerOAuthDeps: ListenerOAuthDeps = {
-  LETTA_CLOUD_API_URL,
-  pollForToken,
-  refreshAccessToken,
-  requestDeviceCode,
-};
-
-let listenerOAuthDepsOverride: ListenerOAuthDeps | null = null;
-
-function getListenerOAuthDeps(): ListenerOAuthDeps {
-  return listenerOAuthDepsOverride ?? defaultListenerOAuthDeps;
-}
-
-class MissingListenerApiKeyError extends Error {
-  constructor() {
-    super("LETTA_API_KEY not found");
-    this.name = "MissingListenerApiKeyError";
-  }
-}
 
 /**
  * Interactive prompt for environment name
@@ -143,17 +122,6 @@ async function flushListenerTelemetryEnd(exitReason: string): Promise<void> {
   }
 }
 
-function getListenerServerUrl(settings: {
-  env?: Record<string, string>;
-}): string {
-  const oauthDeps = getListenerOAuthDeps();
-  return (
-    process.env.LETTA_BASE_URL ||
-    settings.env?.LETTA_BASE_URL ||
-    oauthDeps.LETTA_CLOUD_API_URL
-  );
-}
-
 type ListenerStartupMode =
   | { kind: "remote"; serverUrl: string }
   | {
@@ -162,17 +130,6 @@ type ListenerStartupMode =
       backend: "local" | "self-hosted";
     }
   | { kind: "unsupported-self-hosted"; serverUrl: string };
-
-function normalizeListenerBaseUrl(url: string): string {
-  return url.trim().replace(/\/+$/, "");
-}
-
-function isCloudListenerServerUrl(serverUrl: string): boolean {
-  return (
-    normalizeListenerBaseUrl(serverUrl) ===
-    normalizeListenerBaseUrl(getListenerOAuthDeps().LETTA_CLOUD_API_URL)
-  );
-}
 
 async function resolveListenerStartupMode(
   channelNames: string[],
@@ -225,147 +182,12 @@ function resolveChannelRestoreAgentScope(
   );
 }
 
-async function refreshListenerAccessToken(
-  settings: Awaited<
-    ReturnType<typeof settingsManager.getSettingsWithSecureTokens>
-  >,
-  deviceId: string,
-  connectionName: string,
-): Promise<string> {
-  const oauthDeps = getListenerOAuthDeps();
-  const now = Date.now();
-
-  console.log("Access token expired, refreshing...");
-
-  const tokens = await oauthDeps.refreshAccessToken(
-    settings.refreshToken as string,
-    deviceId,
-    connectionName,
-  );
-
-  settingsManager.updateSettings({
-    env: { LETTA_API_KEY: tokens.access_token },
-    tokenExpiresAt: now + tokens.expires_in * 1000,
-    ...(tokens.refresh_token ? { refreshToken: tokens.refresh_token } : {}),
-  });
-  await settingsManager.flush();
-
-  console.log("Token refreshed successfully.");
-
-  return tokens.access_token;
-}
-
-async function runListenerOAuthLogin(
-  deviceId: string,
-  connectionName: string,
-): Promise<string> {
-  const oauthDeps = getListenerOAuthDeps();
-  console.log("No API key found. Starting OAuth login...\n");
-
-  const deviceData = await oauthDeps.requestDeviceCode();
-
-  console.log(
-    `To authenticate, visit: ${deviceData.verification_uri_complete}`,
-  );
-  console.log(`Your code: ${deviceData.user_code}\n`);
-  console.log("Waiting for authorization...\n");
-
-  const tokens = await oauthDeps.pollForToken(
-    deviceData.device_code,
-    deviceData.interval,
-    deviceData.expires_in,
-    deviceId,
-    connectionName,
-  );
-  const now = Date.now();
-
-  settingsManager.updateSettings({
-    env: { LETTA_API_KEY: tokens.access_token },
-    tokenExpiresAt: now + tokens.expires_in * 1000,
-    ...(tokens.refresh_token ? { refreshToken: tokens.refresh_token } : {}),
-  });
-  await settingsManager.flush();
-
-  console.log("Authenticated successfully.\n");
-
-  return tokens.access_token;
-}
-
-async function resolveListenerRegistrationOptions(
-  deviceId: string,
-  connectionName: string,
-): Promise<RegisterOptions> {
-  const settings = await settingsManager.getSettingsWithSecureTokens();
-  const serverUrl = getListenerServerUrl(settings);
-  const envApiKey = process.env.LETTA_API_KEY;
-
-  if (envApiKey) {
-    return {
-      serverUrl,
-      apiKey: envApiKey,
-      deviceId,
-      connectionName,
-      listenerInstanceId: deriveListenerInstanceId("server", connectionName),
-    };
-  }
-
-  let apiKey = settings.env?.LETTA_API_KEY;
-
-  if (isCloudListenerServerUrl(serverUrl)) {
-    const expiresAt = settings.tokenExpiresAt;
-    if (settings.refreshToken && expiresAt) {
-      const now = Date.now();
-      if (!apiKey || now >= expiresAt - LISTENER_TOKEN_REFRESH_WINDOW_MS) {
-        try {
-          apiKey = await refreshListenerAccessToken(
-            settings,
-            deviceId,
-            connectionName,
-          );
-        } catch (refreshErr) {
-          console.warn(
-            "Token refresh failed:",
-            refreshErr instanceof Error
-              ? refreshErr.message
-              : String(refreshErr),
-          );
-          apiKey = undefined;
-        }
-      }
-    }
-
-    if (!apiKey) {
-      apiKey = await runListenerOAuthLogin(deviceId, connectionName);
-    }
-  }
-
-  if (!apiKey) {
-    throw new MissingListenerApiKeyError();
-  }
-
-  return {
-    serverUrl,
-    apiKey,
-    deviceId,
-    connectionName,
-    listenerInstanceId: deriveListenerInstanceId("server", connectionName),
-  };
-}
-
 export const __listenSubcommandTestUtils = {
   createListenerProcessAnchorPromise,
   flushListenerTelemetryEnd,
   getListenerServerUrl,
   resolveListenerStartupMode,
   resolveListenerRegistrationOptions,
-  setOAuthDepsForTests(overrides: Partial<ListenerOAuthDeps> | null) {
-    listenerOAuthDepsOverride = overrides
-      ? {
-          ...defaultListenerOAuthDeps,
-          ...overrides,
-        }
-      : null;
-  },
 };
 
 const LISTEN_OPTIONS = {
@@ -456,13 +278,33 @@ export async function runListenSubcommand(argv: string[]): Promise<number> {
   await settingsManager.initialize();
   await applyStartupPermissionMode({});
   telemetry.setSurface(getListenerTelemetrySurface());
-  telemetry.init();
+  telemetry.init({ handleSigint: false });
 
   // Register signal handlers so the listener can clean up child processes
   // (subagents, bash commands, PTY sessions) before exiting. Without these,
   // SIGTERM from the desktop app only kills the listener process itself,
   // orphaning its descendants which accumulate over time.
-  const handleShutdownSignal = async (): Promise<void> => {
+  let isShuttingDown = false;
+  let manualListenerLock: ManualListenerLockHandle | null = null;
+  const releaseManualListenerLock = async (): Promise<void> => {
+    const lock = manualListenerLock;
+    manualListenerLock = null;
+    if (!lock) return;
+    try {
+      await lock.release();
+    } catch (error) {
+      console.error(
+        `Failed to release listener lock ${lock.lockPath}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+  };
+  const handleShutdownSignal = async (
+    signal: "SIGINT" | "SIGHUP" | "SIGTERM",
+  ): Promise<void> => {
+    if (isShuttingDown) return;
+    isShuttingDown = true;
     try {
       const { stopListenerClient, isListenerActive } = await import(
         "@/websocket/listen-client"
@@ -479,11 +321,15 @@ export async function runListenSubcommand(argv: string[]): Promise<number> {
     } catch {
       // Best-effort cleanup — don't block exit
     }
+    await flushRemoteSettingsWrites();
+    await releaseManualListenerLock();
+    await flushListenerTelemetryEnd(`listener_${signal.toLowerCase()}`);
     process.exit(0);
   };
 
-  process.once("SIGTERM", handleShutdownSignal);
-  process.once("SIGINT", handleShutdownSignal);
+  process.once("SIGTERM", () => void handleShutdownSignal("SIGTERM"));
+  process.once("SIGINT", () => void handleShutdownSignal("SIGINT"));
+  process.once("SIGHUP", () => void handleShutdownSignal("SIGHUP"));
 
   const exitWithTelemetry = async (
     code: number,
@@ -499,6 +345,8 @@ export async function runListenSubcommand(argv: string[]): Promise<number> {
     } catch {
       // Best effort — don't block exit on channel cleanup failure
     }
+    await flushRemoteSettingsWrites();
+    await releaseManualListenerLock();
     await flushListenerTelemetryEnd(exitReason);
     process.exit(code);
   };
@@ -526,42 +374,6 @@ export async function runListenSubcommand(argv: string[]): Promise<number> {
           restoreAgentScope,
         })
       : [];
-
-  if (channelNames.length > 0) {
-    if (values.channels && values["install-channel-runtimes"]) {
-      const { ensureChannelRuntimeInstalled } = await import(
-        "@/channels/runtime-deps"
-      );
-      const { isSupportedChannelId } = await import(
-        "@/channels/plugin-registry"
-      );
-
-      for (const channelName of channelNames) {
-        if (!isSupportedChannelId(channelName)) {
-          console.error(
-            `Unknown channel "${channelName}" passed to --channels.`,
-          );
-          return 1;
-        }
-        await ensureChannelRuntimeInstalled(channelName);
-      }
-    }
-
-    const { initializeChannels } = await import("@/channels/registry");
-    try {
-      await initializeChannels(channelNames, {
-        failOnStartupError: Boolean(values.channels),
-        restoreAgentScope,
-        logger: debugMode
-          ? (message) => console.log(`[${formatTimestamp()}] ${message}`)
-          : undefined,
-      });
-    } catch (error) {
-      console.error(error instanceof Error ? error.message : String(error));
-      await flushListenerTelemetryEnd("listener_channel_start_failed");
-      return 1;
-    }
-  }
 
   // Determine connection name
   let connectionName: string;
@@ -623,6 +435,117 @@ export async function runListenSubcommand(argv: string[]): Promise<number> {
       return 1;
     }
 
+    let registerOptions: RegisterOptions | null = null;
+    if (startupMode.kind === "remote") {
+      try {
+        registerOptions = await resolveListenerRegistrationOptions(
+          deviceId,
+          connectionName,
+        );
+      } catch (authErr) {
+        if (authErr instanceof MissingListenerApiKeyError) {
+          console.error("Error: LETTA_API_KEY not found");
+          console.error(
+            "Set your API key with: export LETTA_API_KEY=<your-key>",
+          );
+          await flushListenerTelemetryEnd("listener_missing_api_key");
+          return 1;
+        }
+
+        console.error(
+          "OAuth login failed:",
+          authErr instanceof Error ? authErr.message : String(authErr),
+        );
+        await flushListenerTelemetryEnd("listener_oauth_failed");
+        return 1;
+      }
+
+      // A spawner owns Desktop child lifecycle. Standalone `letta server`
+      // and its `letta remote` alias instead claim their exact local
+      // registration slot before starting channel adapters or registering.
+      if (
+        shouldAcquireManualListenerLock(
+          getSpawnerListenerInstanceId(),
+          process.env.LETTA_DESKTOP_MODE === "1",
+        )
+      ) {
+        const listenerInstanceId = registerOptions.listenerInstanceId;
+        if (!listenerInstanceId) {
+          throw new Error("Listener registration identity was not resolved.");
+        }
+        try {
+          manualListenerLock = await acquireManualListenerLock({
+            serverUrl: registerOptions.serverUrl,
+            deviceId,
+            listenerInstanceId,
+          });
+        } catch (lockError) {
+          if (lockError instanceof ManualListenerAlreadyRunningError) {
+            console.error(
+              `A letta server for environment "${connectionName}" is already running on this machine (pid ${lockError.holderPid}).`,
+            );
+            console.error(
+              "Stop that process, or choose a different logical listener with --env-name.",
+            );
+            console.error(`Lock: ${lockError.lockPath}`);
+            await flushListenerTelemetryEnd("listener_already_running");
+            return 1;
+          }
+          if (lockError instanceof ManualListenerLockUnavailableError) {
+            console.error(
+              `Could not establish listener ownership: ${lockError.message}`,
+            );
+            console.error(
+              "No listener was started. Resolve the lock-file error and retry.",
+            );
+            await flushListenerTelemetryEnd("listener_lock_unavailable");
+            return 1;
+          }
+          throw lockError;
+        }
+      }
+    }
+
+    // Start channel adapters only after remote listener ownership is known.
+    // A rejected duplicate must not briefly bind Slack/Telegram runtimes.
+    if (channelNames.length > 0) {
+      if (values.channels && values["install-channel-runtimes"]) {
+        const { ensureChannelRuntimeInstalled } = await import(
+          "@/channels/runtime-deps"
+        );
+        const { isSupportedChannelId } = await import(
+          "@/channels/plugin-registry"
+        );
+
+        for (const channelName of channelNames) {
+          if (!isSupportedChannelId(channelName)) {
+            console.error(
+              `Unknown channel "${channelName}" passed to --channels.`,
+            );
+            await releaseManualListenerLock();
+            return 1;
+          }
+          await ensureChannelRuntimeInstalled(channelName);
+        }
+      }
+
+      const { initializeChannels } = await import("@/channels/registry");
+      try {
+        await initializeChannels(channelNames, {
+          failOnStartupError: Boolean(values.channels),
+          restoreAgentScope,
+          logger: debugMode
+            ? (message) => console.log(`[${formatTimestamp()}] ${message}`)
+            : undefined,
+        });
+      } catch (error) {
+        console.error(error instanceof Error ? error.message : String(error));
+        await releaseManualListenerLock();
+        await flushListenerTelemetryEnd("listener_channel_start_failed");
+        return 1;
+      }
+    }
+
     sessionLog.log(`Session started (debug=${debugMode})`);
     sessionLog.log(`deviceId: ${deviceId}`);
     sessionLog.log(`connectionName: ${connectionName}`);
@@ -675,27 +598,10 @@ export async function runListenSubcommand(argv: string[]): Promise<number> {
       return createListenerProcessAnchorPromise();
     }
 
-    let registerOptions: RegisterOptions;
-
-    try {
-      registerOptions = await resolveListenerRegistrationOptions(
-        deviceId,
-        connectionName,
+    if (!registerOptions) {
+      throw new Error(
+        "Remote listener registration options were not resolved.",
       );
-    } catch (authErr) {
-      if (authErr instanceof MissingListenerApiKeyError) {
-        console.error("Error: LETTA_API_KEY not found");
-        console.error("Set your API key with: export LETTA_API_KEY=<your-key>");
-        await flushListenerTelemetryEnd("listener_missing_api_key");
-        return 1;
-      }
-
-      console.error(
-        "OAuth login failed:",
-        authErr instanceof Error ? authErr.message : String(authErr),
-      );
-      await flushListenerTelemetryEnd("listener_oauth_failed");
-      return 1;
     }
 
     if (debugMode) {
@@ -959,6 +865,8 @@ export async function runListenSubcommand(argv: string[]): Promise<number> {
     const msg = error instanceof Error ? error.message : String(error);
     sessionLog.log(`FATAL: ${msg}`);
     console.error(`Failed to start listener: ${msg}`);
+    await flushRemoteSettingsWrites();
+    await releaseManualListenerLock();
     await flushListenerTelemetryEnd("listener_start_failed");
     return 1;
   }
