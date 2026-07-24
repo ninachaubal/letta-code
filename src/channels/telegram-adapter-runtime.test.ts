@@ -211,7 +211,7 @@ test("telegram channel routes permission prompts and approvals through the topic
     expect.stringContaining("The agent wants approval to run `Bash`."),
     {
       message_thread_id: 42,
-      reply_parameters: { message_id: 42 },
+      reply_parameters: { message_id: 77 },
     },
   );
 

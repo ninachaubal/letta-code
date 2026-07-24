@@ -295,7 +295,7 @@ test("telegram control prompts target private bot topics", async () => {
     expect.stringContaining("Shell"),
     expect.objectContaining({
       message_thread_id: 99,
-      reply_parameters: { message_id: 99 },
+      reply_parameters: { message_id: 42 },
     }),
   );
 });

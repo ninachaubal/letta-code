@@ -144,7 +144,7 @@ export class ChannelControlRequests {
         await adapter.sendDirectReply(
           event.source.chatId,
           formatChannelControlRequestPrompt(event),
-          { replyToMessageId: event.source.threadId ?? event.source.messageId },
+          buildDirectReplyOptions(event.source),
         );
       }
       pending.deliveredThisProcess = true;

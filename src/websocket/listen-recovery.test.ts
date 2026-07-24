@@ -292,7 +292,9 @@ describe("channel control request recovery", () => {
         text: expect.stringContaining(
           "SYSTEM MESSAGE — reply required to continue",
         ),
-        replyToMessageId: "1712790000.000050",
+        // Reply anchor is the user's message, not the thread root; threadId
+        // still routes the reply into the thread.
+        replyToMessageId: "1712800000.000100",
       },
     ]);
     expect(registry.hasPendingControlRequest(event.requestId)).toBe(true);

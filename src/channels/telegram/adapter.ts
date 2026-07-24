@@ -550,7 +550,9 @@ export function createTelegramAdapter(
 
     const telegramBot = await ensureBot();
     const threadId = resolveTelegramOutboundThreadId(source);
-    const replyToMessageId = threadId ?? source.messageId;
+    // Anchor the reply to the triggering message, not the thread root (topic
+    // creation message for bot topics); threadId still routes into the topic.
+    const replyToMessageId = source.messageId ?? undefined;
     let reply_parameters: { message_id: number } | undefined;
     if (replyToMessageId) {
       const numericReplyToMessageId = Number(replyToMessageId);
@@ -908,7 +910,9 @@ export function createTelegramAdapter(
     ): Promise<void> {
       const telegramBot = await ensureBot();
       const threadId = resolveTelegramOutboundThreadId(event.source);
-      const replyToMessageId = threadId ?? event.source.messageId;
+      // Anchor the reply to the triggering message, not the thread root (topic
+      // creation message for bot topics); threadId still routes into the topic.
+      const replyToMessageId = event.source.messageId ?? undefined;
       const reply_parameters = replyToMessageId
         ? { message_id: Number(replyToMessageId) }
         : undefined;

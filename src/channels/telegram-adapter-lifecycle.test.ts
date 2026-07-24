@@ -97,7 +97,7 @@ test("telegram lifecycle errors target private bot topics", async () => {
     "Turn failed:\nSomething failed.",
     expect.objectContaining({
       message_thread_id: 42,
-      reply_parameters: { message_id: 42 },
+      reply_parameters: { message_id: 77 },
     }),
   );
 });
