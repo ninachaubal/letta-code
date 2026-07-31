@@ -77,8 +77,14 @@ export const brandColors = {
   orange: "#FF5533", // dark orange
   blue: "#0707AC", // dark blue
   // text colors
-  primaryAccent: "#8C8CF9", // lighter blue
-  primaryAccentLight: "#BEBEEE", // even lighter blue
+  // Local override: was #8C8CF9/#BEBEEE (brand lavender). Swapped to the value
+  // sitting in this terminal's ANSI blue slot — kitty color4, which in this
+  // non-standard palette is #fc4384 (hot pink). Deliberate: "terminal blue"
+  // means the slot, not the hue. Literal hex rather than the ANSI "blue" named
+  // color so context-chart.ts's hexToFgAnsi(brandColors.primaryAccent) path
+  // still gets parseable hex.
+  primaryAccent: "#fc4384", // terminal ANSI blue slot (color4) — pink
+  primaryAccentLight: "#FD8EB5", // paler pink (shimmer/border tier)
   textMain: "#DEE1E4", // white
   textSecondary: "#A5A8AB", // light grey
   textDisabled: "#46484A", // dark grey
